@@ -1,69 +1,224 @@
-# code-with-quarkus
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+# 🚀 Development Plan with Quarkus + Neo4j (Cypher-DSL + Java Driver) for SCIM
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+## 1. **Architecture Overview**
 
-## Running the application in dev mode
+* **Framework**: Quarkus (fast startup, cloud-native, supports reactive + Panache-style dev)
+* **Persistence**:
 
-You can run your application in dev mode that enables live coding using:
+  * **Neo4j Java Driver** → execute queries
+  * **Cypher-DSL** → type-safe query builder
+* **API Layer**: Quarkus RESTEasy Reactive (JAX-RS endpoints)
+* **Validation**: Hibernate Validator (Jakarta Bean Validation) + schema-driven validation (from Neo4j `(:Schema)` nodes)
+* **Configuration**:
 
-```shell script
-./mvnw quarkus:dev
+  * `application.properties` for Neo4j connection
+  * Support GraalVM native builds for lightweight SCIM service
+
+---
+
+## 2. **Domain Model in Graph (Neo4j)**
+
+We represent SCIM resources as nodes:
+
+* **Schema** (`(:Schema {id, name, description, type})`)
+* **ResourceType** (`(:ResourceType {id, name, endpoint, schema})`)
+* **Objects**:
+
+  * `(:Object:User {id, userName, active, ...})`
+  * `(:Object:Group {id, displayName, members, ...})`
+* **Relationships**:
+
+  * `(ResourceType)-[:USES_SCHEMA]->(Schema)`
+  * `(User)-[:MEMBER_OF]->(Group)`
+  * `(User)-[:HAS_ATTRIBUTE]->(SchemaAttribute)`
+
+This matches SCIM RFC’s flexible schema + extension model.
+
+---
+
+## 3. **Quarkus Project Modules**
+
+### 🔹 API Layer (REST)
+
+* Use **RESTEasy Reactive** (`javax.ws.rs` / `jakarta.ws.rs`)
+* Endpoints: `/Users`, `/Groups`, `/Schemas`
+* Return SCIM-compliant JSON (with `schemas`, `meta`, etc.)
+
+### 🔹 Service Layer
+
+* Business logic per resource:
+
+  * Validation (check `userName` required, uniqueness)
+  * Mapping between SCIM DTOs <-> Neo4j nodes
+  * Handling schema extensions dynamically
+
+### 🔹 Persistence Layer
+
+* **Cypher-DSL** to build Cypher queries
+* **Neo4j Driver** (`org.neo4j.driver.Driver`) to execute them
+* Mapper: `Record → UserDTO / GroupDTO / SchemaDTO`
+
+### 🔹 Schema Registry
+
+* Load SCIM schemas from Neo4j on startup
+* Provide **dynamic validation rules** (e.g., mutability, uniqueness)
+
+---
+
+## 4. **SCIM Endpoints with Quarkus**
+
+### 🔹 Users
+
+```java
+@Path("/v2/ilm/ds/Users")
+@Produces(MediaType.APPLICATION_JSON)
+@Consumes(MediaType.APPLICATION_JSON)
+public class UserResource {
+
+    @Inject UserService userService;
+
+    @POST
+    public Response createUser(UserDto user) {
+        return Response.ok(userService.create(user)).build();
+    }
+
+    @GET
+    public Response listUsers(@QueryParam("filter") String filter) {
+        return Response.ok(userService.list(filter)).build();
+    }
+
+    @GET
+    @Path("/{id}")
+    public Response getUser(@PathParam("id") String id) {
+        return Response.ok(userService.getById(id)).build();
+    }
+
+    @PATCH
+    @Path("/{id}")
+    public Response patchUser(@PathParam("id") String id, PatchRequest patch) {
+        return Response.ok(userService.patch(id, patch)).build();
+    }
+
+    @DELETE
+    @Path("/{id}")
+    public Response deleteUser(@PathParam("id") String id) {
+        userService.delete(id);
+        return Response.noContent().build();
+    }
+}
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+### 🔹 Groups
 
-## Packaging and running the application
+Same CRUD as users, plus membership relationship management.
 
-The application can be packaged using:
+### 🔹 Schemas
 
-```shell script
-./mvnw package
+* Read schema definitions from Neo4j
+* Patch schemas to extend attributes dynamically.
+
+---
+
+## 5. **Using Cypher-DSL in Quarkus**
+
+### Example: Create User
+
+```java
+Node u = Cypher.node("User").named("u");
+
+Statement stmt = Cypher.create(u)
+    .set(u.property("id").to(Cypher.literalOf(user.getId())))
+    .set(u.property("userName").to(Cypher.literalOf(user.getUserName())))
+    .set(u.property("active").to(Cypher.literalOf(user.isActive())))
+    .returning(u)
+    .build();
+
+String cypher = Renderer.getDefaultRenderer().render(stmt);
+try (Session session = driver.session()) {
+    session.run(cypher);
+}
 ```
 
-It produces the `quarkus-run.jar` file in the `target/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `target/quarkus-app/lib/` directory.
+### Example: Filter Users (SCIM `filter=active eq true`)
 
-The application is now runnable using `java -jar target/quarkus-app/quarkus-run.jar`.
-
-If you want to build an _über-jar_, execute the following command:
-
-```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
+```java
+Node u = Cypher.node("User").named("u");
+Statement stmt = Cypher.match(u)
+    .where(u.property("active").isTrue())
+    .returning(u)
+    .build();
 ```
 
-The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.
+---
 
-## Creating a native executable
+## 6. **Validation**
 
-You can create a native executable using:
+* **Static validation**: Bean Validation for DTOs
+* **Dynamic validation**:
 
-```shell script
-./mvnw package -Dnative
-```
+  * Fetch schema definition from Neo4j `(:Schema)`
+  * Enforce rules:
 
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
+    * `mutability=readOnly` → ignore in PATCH
+    * `required=true` → reject missing values
+    * `uniqueness=server` → Cypher query check
 
-```shell script
-./mvnw package -Dnative -Dquarkus.native.container-build=true
-```
+---
 
-You can then execute your native executable with: `./target/code-with-quarkus-1.0.0-SNAPSHOT-runner`
+## 7. **Development Roadmap (Quarkus Sprints)**
 
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/maven-tooling>.
+### **Phase 1 – Setup**
 
-## Related Guides
+* [ ] Quarkus project skeleton (`mvn io.quarkus:quarkus-maven-plugin:create`)
+* [ ] Integrate Neo4j Java Driver (`quarkus-neo4j` extension or custom CDI bean)
+* [ ] Add Cypher-DSL dependency
 
-- JNoSQL Neo4j ([guide](https://docs.quarkiverse.io/quarkus-jnosql/dev/)): Quarkus JNoSQL Neo4j Runtime provides runtime support for integrating Neo4j with Quarkus applications.
-        This extension facilitates seamless integration, enabling efficient storage, retrieval, and management of data within Quarkus projects, enhancing
-        developer productivity.
-- Neo4j client ([guide](https://quarkiverse.github.io/quarkiverse-docs/quarkus-neo4j/dev/index.html)): Connect to Neo4j graph datastore
+### **Phase 2 – Schema Engine**
 
-## Provided Code
+* [ ] Load schemas from Neo4j at startup
+* [ ] Implement schema cache
+* [ ] Validate User attributes against schema
 
-### Quarkus JNoSQL Neo4j Codestart
+### **Phase 3 – User Resource**
 
-Create your first Graph NoSQL entity with Quarkus and JNoSQL Neo4j.
+* [ ] Implement `/Users` CRUD endpoints
+* [ ] Implement SCIM filter → Cypher-DSL parser
+* [ ] Write integration tests (RestAssured + Testcontainers Neo4j)
 
-[Related guide section...](https://docs.quarkiverse.io/quarkus-jnosql/dev/)
+### **Phase 4 – Group Resource**
+
+* [ ] Implement `/Groups` CRUD
+* [ ] Implement `(User)-[:MEMBER_OF]->(Group)` relationships
+
+### **Phase 5 – Schema Resource**
+
+* [ ] `/Schemas` GET + PATCH
+* [ ] Support schema extension nodes
+
+### **Phase 6 – Advanced Features**
+
+* [ ] `/ResourceTypes` endpoint
+* [ ] `/Bulk` operations (batch create/update)
+* [ ] Pagination & sorting in GET
+* [ ] SCIM Search (`filter`, `attributes`, `startIndex`, `count`)
+
+---
+
+## 8. **Testing**
+
+* **Unit tests**: Validate Cypher-DSL query generation
+* **Integration tests**: Use QuarkusDevModeTest + Testcontainers Neo4j
+* **Conformance tests**: SCIM compliance suite
+
+---
+
+## 9. **Deployment & Ops**
+
+* Quarkus native build for containerized deployment
+* Dockerfile with GraalVM native image
+* Config via environment (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASS`)
+* CI/CD pipeline (Maven + Quarkus build plugin)
+
+---
+
